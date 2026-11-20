@@ -1,0 +1,70 @@
+name: P-Bandai restock check
+
+on:
+  # The only trigger: the Cloudflare Worker (cloudflare/worker.js) calls the
+  # workflow_dispatch API every 15 minutes. No GitHub `schedule` on purpose,
+  # it is best-effort and drops runs under load.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        # For manual debugging from the Actions tab: print only, no Telegram,
+        # no state commit. The Worker never sets it.
+        description: "Dry run: print only, no Telegram, no state commit"
+        type: boolean
+        default: false
+
+concurrency:
+  group: pbandai-check
+  cancel-in-progress: false
+
+permissions:
+  contents: write           # needed to commit state/seen.json back
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # `ref` makes checkout take the branch tip at the moment the job starts,
+      # so a queued run sees the state the previous run just pushed (otherwise
+      # the same restock could be announced twice).
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # No pip install: check.py uses only the standard library.
+      - name: Run check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCH_URLS: ${{ vars.WATCH_URLS }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}   # optional
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: python check.py
+
+      - name: Commit updated state
+        if: success() && !inputs.dry_run
+        run: |
+          # A run where every region was unreadable writes no state at all.
+          [ -f state/seen.json ] || { echo "no state file yet"; exit 0; }
+          git config user.name  "pbandai-bot"
+          git config user.email "actions@github.com"
+          git add state/seen.json
+          if git diff --staged --quiet; then
+            echo "no state change"
+            exit 0
+          fi
+          git commit -m "state: update seen items [skip ci]"
+          for i in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push rejected, rebasing (attempt $i)"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep $((i * 3))
+          done
+          echo "push failed after 3 attempts" >&2
+          exit 1
